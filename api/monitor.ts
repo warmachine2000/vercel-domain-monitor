@@ -1,91 +1,115 @@
-// /api/monitor.ts
-export default async function handler(req, res) {
+// api/monitor.ts
+
+import type { VercelRequest, VercelResponse } from "@vercel/node";
+
+export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
-    const domain = (process.env.MONITOR_DOMAIN || "").trim().toLowerCase();
-    if (!domain) return res.status(400).json({ ok: false, error: "MONITOR_DOMAIN not set" });
+    const domain = (process.env.MONITOR_DOMAIN || "").trim();
+    if (!domain) {
+      return res.status(400).json({ ok: false, error: "MONITOR_DOMAIN não definido" });
+    }
 
-    const kvUrl = process.env.KV_REST_API_URL;
-    const kvToken = process.env.KV_REST_API_TOKEN || process.env.KV_REST_API_READ_ONLY_TOKEN;
+    // Telegram
+    const tgToken = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
+    const tgChatId = (process.env.TELEGRAM_CHAT_ID || "").trim();
+    if (!tgToken || !tgChatId) {
+      return res.status(400).json({ ok: false, error: "TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID não definidos" });
+    }
 
+    // Upstash KV REST
+    const kvUrl = (process.env.KV_REST_API_URL || "").trim();
+    const kvToken = (process.env.KV_REST_API_TOKEN || "").trim();
     if (!kvUrl || !kvToken) {
-      return res.status(500).json({ ok: false, error: "Upstash KV env vars missing" });
+      return res.status(400).json({ ok: false, error: "KV_REST_API_URL/KV_REST_API_TOKEN não definidos" });
     }
 
-    // 1) Checa domínio via RDAP
-    const rdap = await fetch(`https://rdap.registro.br/domain/${domain}`, {
-      headers: { "User-Agent": "vercel-domain-monitor/1.0" }
-    });
+    // Cooldown (em segundos) pra evitar spam se ficar chamando /api/monitor no browser
+    const cooldownSec = Number(process.env.NOTIFY_COOLDOWN_SEC || "3600"); // default: 1h
+    const now = Date.now();
 
-    let available = false;
+    const stateKey = `domain-monitor:${domain}:available`;      // "0" ou "1"
+    const lastNotifiedKey = `domain-monitor:${domain}:lastNotify`; // timestamp em ms
 
-    if (rdap.status === 404) {
-      available = true;
-    } else if (rdap.ok) {
-      const data = await rdap.json();
-      const status: string[] = Array.isArray(data?.status) ? data.status : [];
-      if (!status.includes("active")) available = true;
-    } else {
-      // se RDAP der erro (429/500), não notifica pra evitar falso positivo
-      return res.status(200).json({ ok: true, skipped: true, rdap_status: rdap.status });
-    }
-
-    // 2) Lê último estado salvo
-    const stateKey = `domain:${domain}:available`;
-    const lastNotifiedKey = `domain:${domain}:last_notified_at`;
-
-    const [prevStateResp, lastNotifResp] = await Promise.all([
+    // 1) Lê estado anterior e último notify do KV
+    const [prevStateResp, lastNotifyResp] = await Promise.all([
       fetch(`${kvUrl}/get/${encodeURIComponent(stateKey)}`, {
-        headers: { Authorization: `Bearer ${kvToken}` }
+        headers: { Authorization: `Bearer ${kvToken}` },
       }),
       fetch(`${kvUrl}/get/${encodeURIComponent(lastNotifiedKey)}`, {
-        headers: { Authorization: `Bearer ${kvToken}` }
-      })
+        headers: { Authorization: `Bearer ${kvToken}` },
+      }),
     ]);
 
-    const prevStateJson = await prevStateResp.json();
-    const lastNotifJson = await lastNotifResp.json();
+    const prevStateJson = await prevStateResp.json().catch(() => ({}));
+    const lastNotifyJson = await lastNotifyResp.json().catch(() => ({}));
 
-    const prevAvailable = prevStateJson?.result === "1";
-    const lastNotifiedAt = Number(lastNotifJson?.result || 0);
+    const prevAvailable = String(prevStateJson?.result ?? "0") === "1";
+    const lastNotifiedAt = Number(lastNotifyJson?.result ?? "0") || 0;
 
-    // 3) Cooldown (ex: 30 min) pra segurar spam se ficar “available” e alguém bater várias vezes
-    const COOLDOWN_MS = 30 * 60 * 1000;
-    const now = Date.now();
-    const inCooldown = lastNotifiedAt && now - lastNotifiedAt < COOLDOWN_MS;
-
-    const shouldNotify = available && (!prevAvailable) && !inCooldown;
-
-    // 4) Salva estado atual sempre
-    await fetch(`${kvUrl}/set/${encodeURIComponent(stateKey)}/${available ? "1" : "0"}`, {
-      headers: { Authorization: `Bearer ${kvToken}` }
+    // 2) Consulta RDAP do Registro.br
+    const rdapResp = await fetch(`https://rdap.registro.br/domain/${domain}`, {
+      headers: { "User-Agent": "vercel-domain-monitor/1.0" },
     });
 
-    // 5) Se mudou pra disponível, notifica uma vez
-    if (shouldNotify) {
-      await fetch(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    // Regra segura:
+    // - 404 => não existe => disponível (para registrar)
+    // - 200 => existe => NÃO disponível (mesmo que status do RDAP venha diferente de "active")
+    const available = rdapResp.status === 404;
+
+    // 3) Decide se deve notificar
+    const changedToAvailable = !prevAvailable && available;
+    const inCooldown = now - lastNotifiedAt < cooldownSec * 1000;
+
+    let notified = false;
+    let cooldownRemainingSec = 0;
+
+    if (changedToAvailable && !inCooldown) {
+      const tgResp = await fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          chat_id: process.env.TELEGRAM_CHAT_ID,
-          text: `🚨 DOMÍNIO DISPONÍVEL: ${domain}`
-        })
+          chat_id: tgChatId,
+          text: `🚨 DOMÍNIO DISPONÍVEL: ${domain}\n(Registro.br RDAP: 404)`,
+          disable_web_page_preview: true,
+        }),
       });
 
-      // marca horário da notificação (pra cooldown)
-      await fetch(`${kvUrl}/set/${encodeURIComponent(lastNotifiedKey)}/${now}`, {
-        headers: { Authorization: `Bearer ${kvToken}` }
+      if (!tgResp.ok) {
+        const txt = await tgResp.text().catch(() => "");
+        return res.status(502).json({
+          ok: false,
+          error: "Falha ao enviar Telegram",
+          telegram_status: tgResp.status,
+          telegram_body: txt,
+        });
+      }
+
+      notified = true;
+
+      // grava horário do notify
+      await fetch(`${kvUrl}/set/${encodeURIComponent(lastNotifiedKey)}/${encodeURIComponent(String(now))}`, {
+        headers: { Authorization: `Bearer ${kvToken}` },
       });
+    } else {
+      cooldownRemainingSec = inCooldown ? Math.ceil((cooldownSec * 1000 - (now - lastNotifiedAt)) / 1000) : 0;
     }
+
+    // 4) Salva estado atual sempre
+    await fetch(`${kvUrl}/set/${encodeURIComponent(stateKey)}/${available ? "1" : "0"}`, {
+      headers: { Authorization: `Bearer ${kvToken}` },
+    });
 
     return res.status(200).json({
       ok: true,
       domain,
+      rdapHttpStatus: rdapResp.status,
       available,
       prevAvailable,
-      notified: shouldNotify,
-      cooldown: inCooldown
+      notified,
+      cooldownRemainingSec,
+      rule: "available=true somente quando RDAP retorna 404",
     });
   } catch (error: any) {
-    return res.status(500).json({ ok: false, error: error?.message || "unknown_error" });
+    return res.status(500).json({ ok: false, error: error?.message || String(error) });
   }
 }
